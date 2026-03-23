@@ -1,0 +1,19 @@
+name = "infinite-inbox"
+main = "src/index.ts"
+compatibility_date = "2024-03-20"
+compatibility_flags = [ "nodejs_compat" ]
+
+[assets]
+directory = "../app/dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "infinite-inbox-db"
+database_id = "9527f475-831b-46f4-b52e-2580d30a08d7"
+
+[durable_objects]
+bindings = [{ name = "INBOX_STATE", class_name = "WebSocketBroadcaster" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketBroadcaster"]
