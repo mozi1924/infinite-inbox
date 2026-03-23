@@ -1,20 +1,35 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { 
-  Container, Typography, Box, Toolbar, AppBar, Select, MenuItem,
-  FormControl, InputLabel, Button, TextField, Pagination, CircularProgress, IconButton, Tooltip
+import {
+  Container,
+  Typography,
+  Box,
+  Toolbar,
+  AppBar,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+  Button,
+  TextField,
+  Pagination,
+  CircularProgress,
+  IconButton,
+  Tooltip,
+  Alert,
+  Paper,
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive';
 import NotificationsOffIcon from '@mui/icons-material/NotificationsOff';
+import LogoutIcon from '@mui/icons-material/Logout';
 import EmailList from './components/EmailList';
 import EmailViewerModal from './components/EmailViewerModal';
 
-// Set backend URL for dev or prod seamlessly
 const isDev = import.meta.env.DEV || window.location.port === '5173';
 const API_BASE = isDev ? 'http://localhost:8787' : '';
-const WS_BASE = isDev 
-  ? 'ws://localhost:8787/api/ws' 
+const WS_BASE = isDev
+  ? 'ws://localhost:8787/api/ws'
   : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws`;
 
 type EmailSummary = {
@@ -35,6 +50,10 @@ type EmailResponse = {
   total?: number;
 };
 
+type SessionResponse = {
+  authenticated?: boolean;
+};
+
 const isNotificationSupported = typeof window !== 'undefined' && 'Notification' in window;
 
 function normalizeDomain(value: string) {
@@ -49,17 +68,18 @@ export default function App() {
   const [emails, setEmails] = useState<EmailSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [initializing, setInitializing] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [loginKey, setLoginKey] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(
     isNotificationSupported ? Notification.permission : 'denied'
   );
-  
-  // State for filtering & pagination
   const [domainFilter, setDomainFilter] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [limit, setLimit] = useState(20);
   const [page, setPage] = useState(1);
-  
-  // State for selections & modal
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [viewingEmail, setViewingEmail] = useState<EmailSummary | null>(null);
   const [loadingEmail, setLoadingEmail] = useState(false);
@@ -68,25 +88,98 @@ export default function App() {
   const pingIntervalRef = useRef<number | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
 
-  const handleSelectEmail = useCallback(async (email: EmailSummary) => {
-    setViewingEmail(email); // Show partial first
-    setLoadingEmail(true);
+  const closeSocket = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      window.clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
 
-    // Update URL seamlessly
-    const url = new URL(window.location.href);
-    url.searchParams.set('email', email.id);
-    window.history.pushState({}, '', url);
+    if (pingIntervalRef.current) {
+      window.clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
 
-    try {
-      const res = await fetch(`${API_BASE}/api/emails/${email.id}`);
-      const full = await res.json() as EmailSummary;
-      setViewingEmail(full);
-    } catch (err) {
-      console.error('Failed to load full email', err);
-    } finally {
-      setLoadingEmail(false);
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
     }
   }, []);
+
+  const handleUnauthorized = useCallback(() => {
+    setAuthenticated(false);
+    setEmails([]);
+    setTotal(0);
+    setSelectedIds([]);
+    setViewingEmail(null);
+    setLoadingEmail(false);
+    setAuthError('登录状态已失效，请重新输入 API 密钥。');
+    closeSocket();
+  }, [closeSocket]);
+
+  const apiFetch = useCallback(
+    async (input: string, init?: RequestInit) => {
+      const response = await fetch(input, {
+        ...init,
+        credentials: 'include',
+        headers: {
+          ...(init?.headers ?? {}),
+        },
+      });
+
+      if (response.status === 401) {
+        handleUnauthorized();
+      }
+
+      return response;
+    },
+    [handleUnauthorized]
+  );
+
+  const checkSession = useCallback(async () => {
+    try {
+      const res = await apiFetch(`${API_BASE}/api/auth/session`);
+      if (!res.ok) {
+        setAuthenticated(false);
+        return;
+      }
+      const data = (await res.json()) as SessionResponse;
+      setAuthenticated(Boolean(data.authenticated));
+    } catch (err) {
+      console.error('Failed to check session', err);
+      setAuthenticated(false);
+    } finally {
+      setInitializing(false);
+    }
+  }, [apiFetch]);
+
+  useEffect(() => {
+    void checkSession();
+  }, [checkSession]);
+
+  const handleSelectEmail = useCallback(
+    async (email: EmailSummary) => {
+      setViewingEmail(email);
+      setLoadingEmail(true);
+
+      const url = new URL(window.location.href);
+      url.searchParams.set('email', email.id);
+      window.history.pushState({}, '', url);
+
+      try {
+        const res = await apiFetch(`${API_BASE}/api/emails/${email.id}`);
+        if (!res.ok) {
+          throw new Error(`Request failed: ${res.status}`);
+        }
+        const full = (await res.json()) as EmailSummary;
+        setViewingEmail(full);
+      } catch (err) {
+        console.error('Failed to load full email', err);
+      } finally {
+        setLoadingEmail(false);
+      }
+    },
+    [apiFetch]
+  );
 
   const closeEmailViewer = () => {
     setViewingEmail(null);
@@ -105,8 +198,11 @@ export default function App() {
     setNotificationPermission(permission);
   };
 
-  // Handle Initial Deep Link
   useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
     const params = new URLSearchParams(window.location.search);
     const emailId = params.get('email');
     if (emailId) {
@@ -120,7 +216,7 @@ export default function App() {
         created_at: Date.now(),
       });
     }
-    
+
     const onPopState = () => {
       const nextParams = new URLSearchParams(window.location.search);
       const nextEmailId = nextParams.get('email');
@@ -142,7 +238,7 @@ export default function App() {
 
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [handleSelectEmail]);
+  }, [authenticated, handleSelectEmail]);
 
   useEffect(() => {
     if (!isNotificationSupported) {
@@ -160,14 +256,24 @@ export default function App() {
   }, []);
 
   const fetchEmails = useCallback(async () => {
+    if (!authenticated) {
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const offset = (page - 1) * limit;
       let url = `${API_BASE}/api/emails?limit=${limit}&offset=${offset}`;
-      if (domainFilter) url += `&domain=${encodeURIComponent(domainFilter)}`;
-      
-      const res = await fetch(url);
-      const data = await res.json() as EmailResponse;
+      if (domainFilter) {
+        url += `&domain=${encodeURIComponent(domainFilter)}`;
+      }
+
+      const res = await apiFetch(url);
+      if (!res.ok) {
+        throw new Error(`Request failed: ${res.status}`);
+      }
+      const data = (await res.json()) as EmailResponse;
       setEmails(data.emails || []);
       setTotal(data.total || 0);
     } catch (err) {
@@ -175,14 +281,32 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [domainFilter, limit, page]);
+  }, [apiFetch, authenticated, domainFilter, limit, page]);
 
   useEffect(() => {
+    if (!authenticated) {
+      setEmails([]);
+      setTotal(0);
+      setLoading(false);
+      return;
+    }
+
     void fetchEmails();
-  }, [fetchEmails]);
+  }, [authenticated, fetchEmails]);
 
   useEffect(() => {
+    if (!authenticated) {
+      closeSocket();
+      return;
+    }
+
+    let active = true;
+
     const connectWs = () => {
+      if (!active) {
+        return;
+      }
+
       const ws = new WebSocket(WS_BASE);
       wsRef.current = ws;
 
@@ -205,10 +329,10 @@ export default function App() {
         }
 
         try {
-          const data = JSON.parse(event.data);
-          
-          if (data.type === 'NEW_EMAIL') {
-            const email = data.email as EmailSummary;
+          const data = JSON.parse(event.data) as { type?: string; email?: EmailSummary; ids?: string[] };
+
+          if (data.type === 'NEW_EMAIL' && data.email) {
+            const email = data.email;
             const normalizedFilter = normalizeDomain(domainFilter);
             const emailDomain = normalizeDomain(email.to_domain || '');
             const matchesFilter = !normalizedFilter || normalizedFilter === emailDomain;
@@ -242,7 +366,7 @@ export default function App() {
 
             setTotal((currentTotal) => currentTotal + 1);
           } else if (data.type === 'DELETE_EMAILS') {
-            const ids = Array.isArray(data.ids) ? data.ids as string[] : [];
+            const ids = Array.isArray(data.ids) ? data.ids : [];
             if (ids.length === 0) {
               return;
             }
@@ -250,7 +374,6 @@ export default function App() {
             setEmails((prev) => prev.filter((email) => !ids.includes(email.id)));
             setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
             setTotal((currentTotal) => Math.max(0, currentTotal - ids.length));
-
             setViewingEmail((current) => (current && ids.includes(current.id) ? null : current));
             setLoadingEmail((current) => (viewingEmail && ids.includes(viewingEmail.id) ? false : current));
           }
@@ -263,10 +386,28 @@ export default function App() {
         console.error('WebSocket error', error);
       };
 
-      ws.onclose = () => {
+      ws.onclose = async () => {
         if (pingIntervalRef.current) {
           window.clearInterval(pingIntervalRef.current);
           pingIntervalRef.current = null;
+        }
+
+        if (!active) {
+          return;
+        }
+
+        try {
+          const res = await apiFetch(`${API_BASE}/api/auth/session`);
+          if (!res.ok) {
+            return;
+          }
+          const data = (await res.json()) as SessionResponse;
+          if (!data.authenticated) {
+            handleUnauthorized();
+            return;
+          }
+        } catch (err) {
+          console.error('Failed to verify session after socket close', err);
         }
 
         reconnectTimeoutRef.current = window.setTimeout(connectWs, 3000);
@@ -276,27 +417,25 @@ export default function App() {
     connectWs();
 
     return () => {
-      if (reconnectTimeoutRef.current) {
-        window.clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (pingIntervalRef.current) {
-        window.clearInterval(pingIntervalRef.current);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      active = false;
+      closeSocket();
     };
-  }, [domainFilter, handleSelectEmail, limit, page, viewingEmail]);
+  }, [API_BASE, WS_BASE, apiFetch, authenticated, closeSocket, domainFilter, handleSelectEmail, handleUnauthorized, limit, page, viewingEmail]);
 
   const handleDelete = async () => {
-    if (selectedIds.length === 0) return;
+    if (selectedIds.length === 0) {
+      return;
+    }
+
     try {
-      await fetch(`${API_BASE}/api/emails/delete`, {
+      const res = await apiFetch(`${API_BASE}/api/emails/delete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: selectedIds })
+        body: JSON.stringify({ ids: selectedIds }),
       });
-      // WebSocket will broadcast DELETE_EMAILS, and UI will update automatically.
+      if (!res.ok) {
+        throw new Error(`Request failed: ${res.status}`);
+      }
       setSelectedIds([]);
     } catch (err) {
       console.error('Delete failed', err);
@@ -310,7 +449,103 @@ export default function App() {
     setDomainFilter(normalizedInput);
   };
 
+  const handleLogin = async () => {
+    setLoginLoading(true);
+    setAuthError('');
+
+    try {
+      const res = await apiFetch(`${API_BASE}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: loginKey }),
+      });
+
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) {
+        setAuthenticated(false);
+        setAuthError(data.error || '登录失败，请检查 API 密钥。');
+        return;
+      }
+
+      setAuthenticated(true);
+      setLoginKey('');
+      setAuthError('');
+    } catch (err) {
+      console.error('Login failed', err);
+      setAuthError('登录请求失败，请稍后重试。');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await apiFetch(`${API_BASE}/api/auth/logout`, {
+        method: 'POST',
+      });
+    } catch (err) {
+      console.error('Logout failed', err);
+    } finally {
+      handleUnauthorized();
+      setAuthError('');
+      setLoginKey('');
+      const url = new URL(window.location.href);
+      url.searchParams.delete('email');
+      window.history.pushState({}, '', url);
+    }
+  };
+
   const totalPages = Math.ceil(total / limit) || 1;
+
+  if (initializing) {
+    return (
+      <Box sx={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <CircularProgress />
+      </Box>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <Box
+        sx={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: 'background.default',
+          px: 2,
+        }}
+      >
+        <Paper sx={{ width: '100%', maxWidth: 420, p: 4, borderRadius: 3 }} elevation={6}>
+          <Typography variant="h4" sx={{ fontWeight: 700, mb: 1, color: 'primary.main' }}>
+            Infinite Inbox
+          </Typography>
+          <Typography variant="body1" color="text.secondary" sx={{ mb: 3 }}>
+            请输入环境变量中配置的 API 密钥后继续访问邮箱系统。
+          </Typography>
+          {authError ? (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {authError}
+            </Alert>
+          ) : null}
+          <TextField
+            type="password"
+            label="API Key"
+            fullWidth
+            autoFocus
+            value={loginKey}
+            onChange={(e) => setLoginKey(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void handleLogin()}
+            sx={{ mb: 2 }}
+          />
+          <Button variant="contained" fullWidth onClick={() => void handleLogin()} disabled={loginLoading || !loginKey.trim()}>
+            {loginLoading ? '登录中...' : '登录'}
+          </Button>
+        </Paper>
+      </Box>
+    );
+  }
 
   return (
     <Box sx={{ minHeight: '100vh', backgroundColor: 'background.default', pb: 5 }}>
@@ -319,8 +554,8 @@ export default function App() {
           <Typography variant="h5" sx={{ flexGrow: 1, fontWeight: 700, color: 'primary.main', letterSpacing: 1 }}>
             Infinite Inbox
           </Typography>
-          
-          <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+
+          <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             {notificationPermission !== 'granted' ? (
               <Tooltip title={isNotificationSupported ? 'Enable Notifications' : 'Browser notifications are not supported'}>
                 <span>
@@ -336,16 +571,23 @@ export default function App() {
                 </IconButton>
               </Tooltip>
             )}
-            <TextField 
-              size="small" 
-              placeholder="Filter by Domain" 
+            <TextField
+              size="small"
+              placeholder="Filter by Domain"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleApplyFilter()}
               sx={{ width: 200 }}
             />
-            <Button variant="outlined" onClick={handleApplyFilter}>Filter</Button>
-            <Button startIcon={<RefreshIcon />} onClick={() => void fetchEmails()} color="inherit">Refresh</Button>
+            <Button variant="outlined" onClick={handleApplyFilter}>
+              Filter
+            </Button>
+            <Button startIcon={<RefreshIcon />} onClick={() => void fetchEmails()} color="inherit">
+              Refresh
+            </Button>
+            <Button startIcon={<LogoutIcon />} onClick={() => void handleLogout()} color="inherit">
+              Logout
+            </Button>
           </Box>
         </Toolbar>
       </AppBar>
@@ -353,10 +595,10 @@ export default function App() {
       <Container maxWidth="xl" sx={{ mt: 4 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2, alignItems: 'flex-end' }}>
           <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
-            <Button 
-              variant="contained" 
-              color="error" 
-              startIcon={<DeleteIcon />} 
+            <Button
+              variant="contained"
+              color="error"
+              startIcon={<DeleteIcon />}
               disabled={selectedIds.length === 0}
               onClick={handleDelete}
               disableElevation
@@ -387,39 +629,35 @@ export default function App() {
             <CircularProgress />
           </Box>
         ) : (
-           <EmailList 
-            emails={emails} 
+          <EmailList
+            emails={emails}
             selectedIds={selectedIds}
             onToggleSelect={(id) => {
-              setSelectedIds(prev => 
-                prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]
-              );
+              setSelectedIds((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
             }}
             onToggleSelectAll={(selectAll) => {
-              if (selectAll) setSelectedIds(emails.map(e => e.id));
-              else setSelectedIds([]);
+              if (selectAll) {
+                setSelectedIds(emails.map((e) => e.id));
+              } else {
+                setSelectedIds([]);
+              }
             }}
             onSelectEmail={handleSelectEmail}
           />
         )}
-       
+
         <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
-          <Pagination 
-            count={totalPages} 
-            page={page} 
-            onChange={(_, value) => setPage(value)} 
+          <Pagination
+            count={totalPages}
+            page={page}
+            onChange={(_, value) => setPage(value)}
             color="primary"
             shape="rounded"
           />
         </Box>
       </Container>
 
-      <EmailViewerModal 
-        open={!!viewingEmail} 
-        email={viewingEmail} 
-        onClose={closeEmailViewer} 
-        loading={loadingEmail}
-      />
+      <EmailViewerModal open={!!viewingEmail} email={viewingEmail} onClose={closeEmailViewer} loading={loadingEmail} />
     </Box>
   );
 }
