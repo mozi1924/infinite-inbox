@@ -16,12 +16,18 @@ export class WebSocketBroadcaster {
       return new Response("OK");
     }
 
-    if (request.headers.get("Upgrade") === "websocket") {
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
 
       this.state.acceptWebSocket(server);
       this.sessions.add(server);
+
+      try {
+        server.send(JSON.stringify({ type: "CONNECTED" }));
+      } catch (error) {
+        this.sessions.delete(server);
+      }
 
       return new Response(null, {
         status: 101,
@@ -33,7 +39,15 @@ export class WebSocketBroadcaster {
   }
 
   webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
-    // We only broadcast from the worker, clients don't send anything here.
+    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+
+    if (text === "ping") {
+      try {
+        ws.send("pong");
+      } catch (error) {
+        this.sessions.delete(ws);
+      }
+    }
   }
 
   webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {

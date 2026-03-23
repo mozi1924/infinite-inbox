@@ -17,11 +17,41 @@ const WS_BASE = isDev
   ? 'ws://localhost:8787/api/ws' 
   : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws`;
 
+type EmailSummary = {
+  id: string;
+  message_id?: string;
+  from_address: string;
+  to_address: string;
+  to_domain: string;
+  subject: string;
+  text_preview: string;
+  created_at: number;
+  text_content?: string;
+  html_content?: string;
+};
+
+type EmailResponse = {
+  emails?: EmailSummary[];
+  total?: number;
+};
+
+const isNotificationSupported = typeof window !== 'undefined' && 'Notification' in window;
+
+function normalizeDomain(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function canShowBrowserNotification() {
+  return isNotificationSupported && Notification.permission === 'granted' && document.visibilityState !== 'visible';
+}
+
 export default function App() {
-  const [emails, setEmails] = useState<any[]>([]);
+  const [emails, setEmails] = useState<EmailSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [notificationPermission, setNotificationPermission] = useState(Notification.permission);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(
+    isNotificationSupported ? Notification.permission : 'denied'
+  );
   
   // State for filtering & pagination
   const [domainFilter, setDomainFilter] = useState('');
@@ -31,10 +61,14 @@ export default function App() {
   
   // State for selections & modal
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [viewingEmail, setViewingEmail] = useState<any | null>(null);
+  const [viewingEmail, setViewingEmail] = useState<EmailSummary | null>(null);
   const [loadingEmail, setLoadingEmail] = useState(false);
 
-  const handleSelectEmail = async (email: any) => {
+  const wsRef = useRef<WebSocket | null>(null);
+  const pingIntervalRef = useRef<number | null>(null);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+
+  const handleSelectEmail = useCallback(async (email: EmailSummary) => {
     setViewingEmail(email); // Show partial first
     setLoadingEmail(true);
 
@@ -45,14 +79,14 @@ export default function App() {
 
     try {
       const res = await fetch(`${API_BASE}/api/emails/${email.id}`);
-      const full = await res.json();
+      const full = await res.json() as EmailSummary;
       setViewingEmail(full);
     } catch (err) {
-      console.error("Failed to load full email", err);
+      console.error('Failed to load full email', err);
     } finally {
       setLoadingEmail(false);
     }
-  };
+  }, []);
 
   const closeEmailViewer = () => {
     setViewingEmail(null);
@@ -62,14 +96,13 @@ export default function App() {
     window.history.pushState({}, '', url);
   };
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const pingIntervalRef = useRef<any>(null);
-
   const requestNotificationPermission = async () => {
-    if ('Notification' in window) {
-      const permission = await Notification.requestPermission();
-      setNotificationPermission(permission);
+    if (!isNotificationSupported) {
+      return;
     }
+
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
   };
 
   // Handle Initial Deep Link
@@ -77,20 +110,53 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const emailId = params.get('email');
     if (emailId) {
-      handleSelectEmail({ id: emailId, subject: 'Loading...', from_address: '...', text_preview: '' });
+      void handleSelectEmail({
+        id: emailId,
+        subject: 'Loading...',
+        from_address: '...',
+        to_address: '',
+        to_domain: '',
+        text_preview: '',
+        created_at: Date.now(),
+      });
     }
     
     const onPopState = () => {
-      const params = new URLSearchParams(window.location.search);
-      const emailId = params.get('email');
-      if (emailId) handleSelectEmail({ id: emailId, subject: 'Loading...', from_address: '', text_preview: '' });
-      else {
+      const nextParams = new URLSearchParams(window.location.search);
+      const nextEmailId = nextParams.get('email');
+      if (nextEmailId) {
+        void handleSelectEmail({
+          id: nextEmailId,
+          subject: 'Loading...',
+          from_address: '',
+          to_address: '',
+          to_domain: '',
+          text_preview: '',
+          created_at: Date.now(),
+        });
+      } else {
         setViewingEmail(null);
         setLoadingEmail(false);
       }
     };
+
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
+  }, [handleSelectEmail]);
+
+  useEffect(() => {
+    if (!isNotificationSupported) {
+      return;
+    }
+
+    const syncPermission = () => setNotificationPermission(Notification.permission);
+    document.addEventListener('visibilitychange', syncPermission);
+    window.addEventListener('focus', syncPermission);
+
+    return () => {
+      document.removeEventListener('visibilitychange', syncPermission);
+      window.removeEventListener('focus', syncPermission);
+    };
   }, []);
 
   const fetchEmails = useCallback(async () => {
@@ -101,7 +167,7 @@ export default function App() {
       if (domainFilter) url += `&domain=${encodeURIComponent(domainFilter)}`;
       
       const res = await fetch(url);
-      const data = await res.json();
+      const data = await res.json() as EmailResponse;
       setEmails(data.emails || []);
       setTotal(data.total || 0);
     } catch (err) {
@@ -112,7 +178,7 @@ export default function App() {
   }, [domainFilter, limit, page]);
 
   useEffect(() => {
-    fetchEmails();
+    void fetchEmails();
   }, [fetchEmails]);
 
   useEffect(() => {
@@ -121,64 +187,106 @@ export default function App() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        pingIntervalRef.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
-        }, 30000); // 30s keep-alive
+        if (reconnectTimeoutRef.current) {
+          window.clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
+
+        pingIntervalRef.current = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send('ping');
+          }
+        }, 30000);
       };
 
       ws.onmessage = (event) => {
+        if (event.data === 'pong') {
+          return;
+        }
+
         try {
           const data = JSON.parse(event.data);
           
           if (data.type === 'NEW_EMAIL') {
-            const email = data.email;
-            
-            // Dispatch Notification
-            if (Notification.permission === 'granted') {
-              const notification = new Notification(`New Email: ${email.subject}`, {
-                body: `From: ${email.from_address}\n${email.text_preview}`,
+            const email = data.email as EmailSummary;
+            const normalizedFilter = normalizeDomain(domainFilter);
+            const emailDomain = normalizeDomain(email.to_domain || '');
+            const matchesFilter = !normalizedFilter || normalizedFilter === emailDomain;
+
+            if (canShowBrowserNotification()) {
+              const notification = new Notification(`New Email: ${email.subject || 'No Subject'}`, {
+                body: `From: ${email.from_address || 'Unknown sender'}\n${email.text_preview || 'Open Infinite Inbox to view the full message.'}`,
+                tag: email.id,
               });
               notification.onclick = () => {
                 window.focus();
-                handleSelectEmail(email);
+                void handleSelectEmail(email);
+                notification.close();
               };
             }
 
-            // Only add if it matches current domain filter
-            setDomainFilter((currentFilter) => {
-              if (!currentFilter || currentFilter === email.to_domain) {
-                setEmails(prev => {
-                  const newEmails = [email, ...prev];
-                  // If we exceed limit, we could pop, but let's just keep it simple
-                  // or trigger a refetch if pagination is complex
-                  return newEmails;
-                });
-                setTotal(t => t + 1);
+            if (!matchesFilter) {
+              return;
+            }
+
+            setEmails((prev) => {
+              const deduped = prev.filter((item) => item.id !== email.id);
+              const nextEmails = [email, ...deduped];
+
+              if (page !== 1) {
+                return prev;
               }
-              return currentFilter;
+
+              return nextEmails.slice(0, limit);
             });
+
+            setTotal((currentTotal) => currentTotal + 1);
           } else if (data.type === 'DELETE_EMAILS') {
-            const ids = data.ids as string[];
-            setEmails(prev => prev.filter(e => !ids.includes(e.id)));
-            setTotal(t => Math.max(0, t - ids.length));
+            const ids = Array.isArray(data.ids) ? data.ids as string[] : [];
+            if (ids.length === 0) {
+              return;
+            }
+
+            setEmails((prev) => prev.filter((email) => !ids.includes(email.id)));
+            setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
+            setTotal((currentTotal) => Math.max(0, currentTotal - ids.length));
+
+            setViewingEmail((current) => (current && ids.includes(current.id) ? null : current));
+            setLoadingEmail((current) => (viewingEmail && ids.includes(viewingEmail.id) ? false : current));
           }
         } catch (e) {
-          console.error("WS Parse error", e);
+          console.error('WS Parse error', e);
         }
       };
 
+      ws.onerror = (error) => {
+        console.error('WebSocket error', error);
+      };
+
       ws.onclose = () => {
-        clearInterval(pingIntervalRef.current);
-        setTimeout(connectWs, 3000); // Reconnect
+        if (pingIntervalRef.current) {
+          window.clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+
+        reconnectTimeoutRef.current = window.setTimeout(connectWs, 3000);
       };
     };
 
     connectWs();
+
     return () => {
-      clearInterval(pingIntervalRef.current);
-      if (wsRef.current) wsRef.current.close();
+      if (reconnectTimeoutRef.current) {
+        window.clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (pingIntervalRef.current) {
+        window.clearInterval(pingIntervalRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
-  }, []);
+  }, [domainFilter, handleSelectEmail, limit, page, viewingEmail]);
 
   const handleDelete = async () => {
     if (selectedIds.length === 0) return;
@@ -197,7 +305,9 @@ export default function App() {
 
   const handleApplyFilter = () => {
     setPage(1);
-    setDomainFilter(searchInput);
+    const normalizedInput = normalizeDomain(searchInput);
+    setSearchInput(normalizedInput);
+    setDomainFilter(normalizedInput);
   };
 
   const totalPages = Math.ceil(total / limit) || 1;
@@ -212,10 +322,12 @@ export default function App() {
           
           <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
             {notificationPermission !== 'granted' ? (
-              <Tooltip title="Enable Notifications">
-                <IconButton onClick={requestNotificationPermission} color="warning">
-                  <NotificationsOffIcon />
-                </IconButton>
+              <Tooltip title={isNotificationSupported ? 'Enable Notifications' : 'Browser notifications are not supported'}>
+                <span>
+                  <IconButton onClick={requestNotificationPermission} color="warning" disabled={!isNotificationSupported}>
+                    <NotificationsOffIcon />
+                  </IconButton>
+                </span>
               </Tooltip>
             ) : (
               <Tooltip title="Notifications Enabled">
@@ -233,7 +345,7 @@ export default function App() {
               sx={{ width: 200 }}
             />
             <Button variant="outlined" onClick={handleApplyFilter}>Filter</Button>
-            <Button startIcon={<RefreshIcon />} onClick={fetchEmails} color="inherit">Refresh</Button>
+            <Button startIcon={<RefreshIcon />} onClick={() => void fetchEmails()} color="inherit">Refresh</Button>
           </Box>
         </Toolbar>
       </AppBar>
